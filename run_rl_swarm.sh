@@ -34,17 +34,106 @@ IDENTITY_PATH=${IDENTITY_PATH:-$DEFAULT_IDENTITY_PATH}
 SMALL_SWARM_CONTRACT="0x69C6e1D608ec64885E7b185d39b04B491a71768C"
 BIG_SWARM_CONTRACT="0x6947c6E196a48B77eFa9331EC1E3e45f3Ee5Fd58"
 
-CPU_ONLY=${CPU_ONLY:-""}
+if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+  if command -v apt &>/dev/null; then
+    echo -e "${CYAN}${BOLD}[✓] Debian/Ubuntu detected. Installing build-essential, gcc, g++...${NC}"
+    sudo apt update > /dev/null 2>&1
+    sudo apt install -y build-essential gcc g++ > /dev/null 2>&1
+  elif command -v yum &>/dev/null; then
+    echo -e "${CYAN}${BOLD}[✓] RHEL/CentOS detected. Installing Development Tools...${NC}"
+    sudo yum groupinstall -y "Development Tools" > /dev/null 2>&1
+    sudo yum install -y gcc gcc-c++ > /dev/null 2>&1
+  elif command -v pacman &>/dev/null; then
+    echo -e "${CYAN}${BOLD}[✓] Arch Linux detected. Installing base-devel...${NC}"
+    sudo pacman -Sy --noconfirm base-devel gcc > /dev/null 2>&1
+  else
+    echo -e "${RED}${BOLD}[✗] Linux detected but unsupported package manager.${NC}"
+    exit 1
+  fi
+elif [[ "$OSTYPE" == "darwin"* ]]; then
+  echo -e "${CYAN}${BOLD}[✓] macOS detected. Installing Xcode Command Line Tools...${NC}"
+  xcode-select --install > /dev/null 2>&1
+else
+  echo -e "${RED}${BOLD}[✗] Unsupported OS: $OSTYPE${NC}"
+  exit 1
+fi
+
+if command -v gcc &>/dev/null; then
+  export CC=$(command -v gcc)
+  echo -e "${CYAN}${BOLD}[✓] Exported CC=$CC${NC}"
+else
+  echo -e "${RED}${BOLD}[✗] gcc not found. Please install it manually.${NC}"
+fi
 
 check_cuda_installation() {
-    echo -e "\n${CYAN}${BOLD}[✓] Checking CUDA and NVCC installation...${NC}"
+    echo -e "\n${CYAN}${BOLD}[✓] Checking GPU and CUDA installation...${NC}"
     
+    GPU_AVAILABLE=false
     CUDA_AVAILABLE=false
     NVCC_AVAILABLE=false
     
+    detect_gpu() {
+        if command -v lspci &> /dev/null; then
+            if lspci | grep -i nvidia &> /dev/null; then
+                echo -e "${GREEN}${BOLD}[✓] NVIDIA GPU detected (via lspci)${NC}"
+                return 0
+            elif lspci | grep -i "vga\|3d\|display" | grep -i "amd\|radeon\|ati" &> /dev/null; then
+                echo -e "${YELLOW}${BOLD}[!] AMD GPU detected (via lspci)${NC}"
+                echo -e "${YELLOW}${BOLD}[!] This script only supports NVIDIA GPUs for CUDA installation${NC}"
+                return 2 
+            fi
+            return 1 
+        fi
+        
+        if command -v nvidia-smi &> /dev/null; then
+            if nvidia-smi &> /dev/null; then
+                echo -e "${GREEN}${BOLD}[✓] NVIDIA GPU detected (via nvidia-smi)${NC}"
+                return 0
+            fi
+        fi
+        
+        if [ -d "/proc/driver/nvidia" ] || [ -d "/dev/nvidia0" ]; then
+            echo -e "${GREEN}${BOLD}[✓] NVIDIA GPU detected (via system directories)${NC}"
+            return 0
+        fi
+        
+        if [ -x "/usr/local/cuda/samples/bin/x86_64/linux/release/deviceQuery" ]; then
+            if /usr/local/cuda/samples/bin/x86_64/linux/release/deviceQuery | grep "Result = PASS" &> /dev/null; then
+                echo -e "${GREEN}${BOLD}[✓] NVIDIA GPU detected (via deviceQuery)${NC}"
+                return 0
+            fi
+        fi
+
+        if [ -d "/sys/class/gpu" ] || ls /sys/bus/pci/devices/*/vendor 2>/dev/null | xargs cat 2>/dev/null | grep -q "0x10de"; then
+            echo -e "${GREEN}${BOLD}[✓] NVIDIA GPU detected (via sysfs)${NC}"
+            return 0
+        fi
+
+        echo -e "${YELLOW}${BOLD}[!] No NVIDIA GPU detected with any detection method${NC}"
+        return 1
+    }
+    
+    detect_gpu
+    gpu_result=$?
+    
+    if [ $gpu_result -eq 0 ]; then
+        GPU_AVAILABLE=true
+    elif [ $gpu_result -eq 2 ]; then
+        echo -e "${YELLOW}${BOLD}[!] Proceeding with CPU-only mode${NC}"
+        CPU_ONLY="true"
+        return 0
+    else
+        echo -e "${YELLOW}${BOLD}[!] No NVIDIA GPU detected - using CPU-only mode${NC}"
+        echo -e "${YELLOW}${BOLD}[!] CUDA installation will be skipped${NC}"
+        CPU_ONLY="true"
+        return 0
+    fi
+
     if command -v nvidia-smi &> /dev/null; then
         echo -e "${GREEN}${BOLD}[✓] CUDA drivers detected (nvidia-smi found)${NC}"
         CUDA_AVAILABLE=true
+        echo -e "${CYAN}${BOLD}[✓] GPU information:${NC}"
+        nvidia-smi --query-gpu=name,driver_version,temperature.gpu,utilization.gpu --format=csv,noheader
     elif [ -d "/proc/driver/nvidia" ]; then
         echo -e "${GREEN}${BOLD}[✓] CUDA drivers detected (NVIDIA driver directory found)${NC}"
         CUDA_AVAILABLE=true
@@ -60,20 +149,16 @@ check_cuda_installation() {
         echo -e "${YELLOW}${BOLD}[!] NVCC compiler not detected${NC}"
     fi
     
-    if [ "$CUDA_AVAILABLE" = false ] || [ "$NVCC_AVAILABLE" = false ]; then
-        echo -e "${YELLOW}${BOLD}[!] CUDA environment is not completely set up${NC}"
-        
+    if [ "$GPU_AVAILABLE" = true ] && ([ "$CUDA_AVAILABLE" = false ] || [ "$NVCC_AVAILABLE" = false ]); then
+        echo -e "${YELLOW}${BOLD}[!] NVIDIA GPU is available but CUDA environment is not completely set up${NC}"
         read -p "Would you like to install CUDA and NVCC? [Y/n] " install_choice
         install_choice=${install_choice:-Y}
         
         if [[ $install_choice =~ ^[Yy]$ ]]; then
             echo -e "${CYAN}${BOLD}[✓] Downloading and running CUDA installation script from GitHub...${NC}"
-            
             bash <(curl -sSL https://raw.githubusercontent.com/zunxbt/gensyn-testnet/main/cuda.sh)
-            
             if [ $? -eq 0 ]; then
                 echo -e "${GREEN}${BOLD}[✓] CUDA installation script completed successfully${NC}"
-                
                 source ~/.profile 2>/dev/null || true
                 source ~/.bashrc 2>/dev/null || true
                 
@@ -105,12 +190,20 @@ check_cuda_installation() {
             else
                 echo -e "${RED}${BOLD}[✗] CUDA installation failed${NC}"
                 echo -e "${YELLOW}${BOLD}[!] Please try installing CUDA manually by following NVIDIA's installation guide${NC}"
+                echo -e "${YELLOW}${BOLD}[!] Proceeding with CPU-only mode${NC}"
+                CPU_ONLY="true"
             fi
         else
             echo -e "${YELLOW}${BOLD}[!] Proceeding without CUDA installation${NC}"
-            echo -e "${YELLOW}${BOLD}[!] Note: GPU acceleration will not be available${NC}"
+            echo -e "${YELLOW}${BOLD}[!] CPU-only mode will be used${NC}"
             CPU_ONLY="true"
         fi
+    elif [ "$GPU_AVAILABLE" = true ] && [ "$CUDA_AVAILABLE" = true ] && [ "$NVCC_AVAILABLE" = true ]; then
+        echo -e "${GREEN}${BOLD}[✓] GPU with CUDA environment properly configured${NC}"
+        CPU_ONLY="false"
+    else
+        echo -e "${YELLOW}${BOLD}[!] Using CPU-only mode${NC}"
+        CPU_ONLY="true"
     fi
     
     return 0
@@ -118,8 +211,16 @@ check_cuda_installation() {
 
 check_cuda_installation
 
+export CPU_ONLY
+
+if [ "$CPU_ONLY" = "true" ]; then
+    echo -e "\n${YELLOW}${BOLD}[✓] Running in CPU-only mode${NC}"
+else
+    echo -e "\n${GREEN}${BOLD}[✓] Running with GPU acceleration${NC}"
+fi
+
 while true; do
-    echo -e "\033[36m\033[1mPlease select a swarm to join:\n[A] Math\n[B] Math Hard\033[0m"
+    echo -e "\n\033[36m\033[1mPlease select a swarm to join:\n[A] Math\n[B] Math Hard\033[0m"
     read -p "> " ab
     ab=${ab:-A}
     case $ab in
@@ -149,8 +250,10 @@ cleanup() {
     echo -e "${YELLOW}${BOLD}[✓] Shutting down processes...${NC}"
     kill $SERVER_PID 2>/dev/null || true
     kill $TUNNEL_PID 2>/dev/null || true
+    rm -f server.log ngrok_output.log
     exit 0
 }
+
 trap cleanup INT
 
 if ls "$HOME/rl-swarm/modal-login/temp-data/"*.json 1> /dev/null 2>&1; then
@@ -166,27 +269,27 @@ if [ -f "modal-login/temp-data/userData.json" ]; then
     
     echo -e "\n${CYAN}${BOLD}[✓] Starting the development server...${NC}"
     if ! command -v ss &>/dev/null; then
-        echo -e "${YELLOW}[!] 'ss' not found. Attempting to install 'iproute2'...${NC}"
-        if command -v apt &>/dev/null; then
-            sudo apt update && sudo apt install -y iproute2
-        elif command -v yum &>/dev/null; then
-            sudo yum install -y iproute
-        elif command -v pacman &>/dev/null; then
-            sudo pacman -Sy iproute2
-        else
-            echo -e "${RED}[✗] Could not install 'ss'. Package manager not found.${NC}"
-            exit 1
-        fi
+      echo -e "${YELLOW}[!] 'ss' not found. Attempting to install 'iproute2'...${NC}"
+      if command -v apt &>/dev/null; then
+        sudo apt update && sudo apt install -y iproute2
+      elif command -v yum &>/dev/null; then
+        sudo yum install -y iproute
+      elif command -v pacman &>/dev/null; then
+        sudo pacman -Sy iproute2
+      else
+        echo -e "${RED}[✗] Could not install 'ss'. Package manager not found.${NC}"
+        exit 1
+      fi
     fi
     
     PORT_LINE=$(ss -ltnp | grep ":3000 ")
     if [ -n "$PORT_LINE" ]; then
-        PID=$(echo "$PORT_LINE" | grep -oP 'pid=\K[0-9]+')
-        if [ -n "$PID" ]; then
-            echo -e "${YELLOW}[!] Port 3000 is in use. Killing process: $PID${NC}"
-            kill -9 $PID
-            sleep 2
-        fi
+      PID=$(echo "$PORT_LINE" | grep -oP 'pid=\K[0-9]+')
+      if [ -n "$PID" ]; then
+        echo -e "${YELLOW}[!] Port 3000 is in use. Killing process: $PID${NC}"
+        kill -9 $PID
+        sleep 2
+      fi
     fi
     
     npm run dev > server.log 2>&1 &
@@ -222,27 +325,27 @@ else
     
     echo -e "\n${CYAN}${BOLD}[✓] Starting the development server...${NC}"
     if ! command -v ss &>/dev/null; then
-        echo -e "${YELLOW}[!] 'ss' not found. Attempting to install 'iproute2'...${NC}"
-        if command -v apt &>/dev/null; then
-            sudo apt update && sudo apt install -y iproute2
-        elif command -v yum &>/dev/null; then
-            sudo yum install -y iproute
-        elif command -v pacman &>/dev/null; then
-            sudo pacman -Sy iproute2
-        else
-            echo -e "${RED}[✗] Could not install 'ss'. Package manager not found.${NC}"
-            exit 1
-        fi
+      echo -e "${YELLOW}[!] 'ss' not found. Attempting to install 'iproute2'...${NC}"
+      if command -v apt &>/dev/null; then
+        sudo apt update && sudo apt install -y iproute2
+      elif command -v yum &>/dev/null; then
+        sudo yum install -y iproute
+      elif command -v pacman &>/dev/null; then
+        sudo pacman -Sy iproute2
+      else
+        echo -e "${RED}[✗] Could not install 'ss'. Package manager not found.${NC}"
+        exit 1
+      fi
     fi
     
     PORT_LINE=$(ss -ltnp | grep ":3000 ")
     if [ -n "$PORT_LINE" ]; then
-        PID=$(echo "$PORT_LINE" | grep -oP 'pid=\K[0-9]+')
-        if [ -n "$PID" ]; then
-            echo -e "${YELLOW}[!] Port 3000 is in use. Killing process: $PID${NC}"
-            kill -9 $PID
-            sleep 2
-        fi
+      PID=$(echo "$PORT_LINE" | grep -oP 'pid=\K[0-9]+')
+      if [ -n "$PID" ]; then
+        echo -e "${YELLOW}[!] Port 3000 is in use. Killing process: $PID${NC}"
+        kill -9 $PID
+        sleep 2
+      fi
     fi
     
     npm run dev > server.log 2>&1 &
@@ -479,13 +582,8 @@ else
     fi
 fi
 
-if [ -n "$VIRTUAL_ENV" ]; then
-    echo -e "\n${CYAN}${BOLD}[✓] Jonathan existing virtual environment...${NC}"
-    deactivate
-fi
-
 echo -e "${CYAN}${BOLD}[✓] Setting up Python virtual environment...${NC}"
-python3 -m venv .venv && source .venv/bin/activate && \
+python3 -m venv .venv && . .venv/bin/activate && \
 echo -e "${GREEN}${BOLD}[✓] Python virtual environment set up successfully.${NC}" || \
 echo -e "${RED}${BOLD}[✗] Failed to set up virtual environment.${NC}"
 
@@ -538,7 +636,6 @@ fi
 
 echo -e "\n${GREEN}${BOLD}[✓] Good luck in the swarm! Your training session is about to begin.\n${NC}"
 [ "$(uname)" = "Darwin" ] && sed -i '' -E 's/(startup_timeout: *float *= *)[0-9.]+/\1120/' $(python3 -c "import hivemind.p2p.p2p_daemon as m; print(m.__file__)") || sed -i -E 's/(startup_timeout: *float *= *)[0-9.]+/\1120/' $(python3 -c "import hivemind.p2p.p2p_daemon as m; print(m.__file__)")
-sleep 2
 
 if [ -n "$ORG_ID" ]; then
     python -m hivemind_exp.gsm8k.train_single_gpu \
