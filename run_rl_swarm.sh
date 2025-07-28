@@ -134,40 +134,57 @@ if [ "$CONNECT_TO_TESTNET" = true ]; then
     echo "Your ORG_ID is set to: $ORG_ID"
 fi
 
-echo_green ">> Installing Python requirements..."
+echo_green ">> Getting requirements..."
 pip install --upgrade pip
-pip install git+https://github.com/xailong-6969/genrl-swarm
-pip install reasoning-gym>=0.1.20
-pip install trl
-pip install vllm==0.7.3
-pip install bitsandbytes 
-pip install hivemind@git+https://github.com/gensyn-ai/hivemind@639c964a8019de63135a2594663b5bec8e5356dd
 
-# Copy default config if needed
+# echo_green ">> Installing GenRL..."
+pip install gensyn-genrl==0.1.4
+pip install reasoning-gym>=0.1.20 # for reasoning gym env
+pip install trl # for grpo config, will be deprecated soon
+pip install hivemind@git+https://github.com/gensyn-ai/hivemind@639c964a8019de63135a2594663b5bec8e5356dd # We need the latest, 1.1.11 is broken
+
+
 if [ ! -d "$ROOT/configs" ]; then
     mkdir "$ROOT/configs"
-fi
-if [ ! -f "$ROOT/configs/rg-swarm.yaml" ]; then
+fi  
+if [ -f "$ROOT/configs/rg-swarm.yaml" ]; then
+    # Use cmp -s for a silent comparison. If different, backup and copy.
+    if ! cmp -s "$ROOT/rgym_exp/config/rg-swarm.yaml" "$ROOT/configs/rg-swarm.yaml"; then
+        if [ -z "$GENSYN_RESET_CONFIG" ]; then
+            echo_green ">> Found differences in rg-swarm.yaml. If you would like to reset to the default, set GENSYN_RESET_CONFIG to a non-empty value."
+        else
+            echo_green ">> Found differences in rg-swarm.yaml. Backing up existing config."
+            mv "$ROOT/configs/rg-swarm.yaml" "$ROOT/configs/rg-swarm.yaml.bak"
+            cp "$ROOT/rgym_exp/config/rg-swarm.yaml" "$ROOT/configs/rg-swarm.yaml"
+        fi
+    fi
+else
+    # If the config doesn't exist, just copy it.
     cp "$ROOT/rgym_exp/config/rg-swarm.yaml" "$ROOT/configs/rg-swarm.yaml"
 fi
 
-echo_green ">> Setup complete!"
-
-# Handle Hugging Face token
-HF_TOKEN=${HF_TOKEN:-""}
-if [ -z "${HF_TOKEN}" ]; then
-    echo -en $GREEN_TEXT
-    read -p ">> Would you like to push models to the Hugging Face Hub? [y/N] " yn
-    echo -en $RESET_TEXT
-    case ${yn:-N} in
-        [Yy]*) read -p "Enter your Hugging Face access token: " HUGGINGFACE_ACCESS_TOKEN ;;
-        *) HUGGINGFACE_ACCESS_TOKEN="None" ;;
-    esac
-else
-    HUGGINGFACE_ACCESS_TOKEN=${HF_TOKEN}
+if [ -n "$DOCKER" ]; then
+    # Make it easier to edit the configs on Linux systems.
+    sudo chmod -R 0777 /home/gensyn/rl_swarm/configs
 fi
 
-# ✅ KEY FIX: Restored the interactive prompt for model selection as requested.
+echo_green ">> Done!"
+
+HF_TOKEN=${HF_TOKEN:-""}
+if [ -n "${HF_TOKEN}" ]; then # Check if HF_TOKEN is already set and use if so. Else give user a prompt to choose.
+    HUGGINGFACE_ACCESS_TOKEN=${HF_TOKEN}
+else
+    echo -en $GREEN_TEXT
+    read -p ">> Would you like to push models you train in the RL swarm to the Hugging Face Hub? [y/N] " yn
+    echo -en $RESET_TEXT
+    yn=${yn:-N} # Default to "N" if the user presses Enter
+    case $yn in
+        [Yy]*) read -p "Enter your Hugging Face access token: " HUGGINGFACE_ACCESS_TOKEN ;;
+        [Nn]*) HUGGINGFACE_ACCESS_TOKEN="None" ;;
+        *) echo ">>> No answer was given, so NO models will be pushed to Hugging Face Hub" && HUGGINGFACE_ACCESS_TOKEN="None" ;;
+    esac
+fi
+
 echo -en $GREEN_TEXT
 read -p ">> Enter the name of the model you want to use in huggingface repo/name format, or press [Enter] to use the default model. " MODEL_NAME
 echo -en $RESET_TEXT
@@ -187,4 +204,4 @@ python -m rgym_exp.runner.swarm_launcher \
     --config-path "$ROOT/rgym_exp/config" \
     --config-name "rg-swarm.yaml" 
 
-wait # Keep script running until Ctrl+C
+wait  # Keep script running until Ctrl+C
